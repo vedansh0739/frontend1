@@ -4,34 +4,41 @@ import { Wallet, verifyMessage, BrowserProvider } from 'ethers'
 import RingSignatureExplanation from './RingSignatureExplanation'
 import { generateSimplifiedRingSignature, verifyRingSignature, getPrivateKeyBytes } from './ringSignature'
 
+// Main application component for the Ring Signature Demo
 function App() {
+  // State hooks for UI and crypto logic
   const [currentPage, setCurrentPage] = useState('demo') // 'demo' or 'explanation'
-  const [ringMembers, setRingMembers] = useState([]) // [{ address, type: 'local'|'external', wallet? }]
-  const [ringAddresses, setRingAddresses] = useState([])
-  const [hiddenIndex, setHiddenIndex] = useState(null)
-  const [message, setMessage] = useState('Ring signatures provide signer ambiguity.')
-  const [signature, setSignature] = useState(null)
-  const [ringSignature, setRingSignature] = useState(null) // True ring signature object
-  const [recoveredAddress, setRecoveredAddress] = useState(null)
-  const [verificationResult, setVerificationResult] = useState(null)
-  const [revealSigner, setRevealSigner] = useState(false)
-  const [extSigner, setExtSigner] = useState(null)
-  const [connectedAddress, setConnectedAddress] = useState(null)
-  const [network, setNetwork] = useState(null)
-  const [lastRpc, setLastRpc] = useState(null)
-  const [isFetchingEtherscan, setIsFetchingEtherscan] = useState(false)
-  const [fetchError, setFetchError] = useState(null)
-
+  const [ringMembers, setRingMembers] = useState([]) // Full ring: [{ address, type: 'local'|'external', wallet? }]
+  const [ringAddresses, setRingAddresses] = useState([]) // Just address strings for the ring
+  const [hiddenIndex, setHiddenIndex] = useState(null) // Index of the hidden (signing) member
+  const [message, setMessage] = useState('Ring signatures provide signer ambiguity.') // Message to sign
+  const [signature, setSignature] = useState(null) // Raw ECDSA signature (traditional)
+  const [ringSignature, setRingSignature] = useState(null) // "True" or concept ring signature object payload
+  const [recoveredAddress, setRecoveredAddress] = useState(null) // Address recovered by verification
+  const [verificationResult, setVerificationResult] = useState(null) // Result details for verification
+  const [revealSigner, setRevealSigner] = useState(false) // Control: reveal who is hidden signer (debug)
+  const [extSigner, setExtSigner] = useState(null) // ethers.js Signer obtained from MetaMask
+  const [connectedAddress, setConnectedAddress] = useState(null) // Fetched Ethereum address from wallet
+  const [network, setNetwork] = useState(null) // Ethereum network (chainId, name)
+  const [lastRpc, setLastRpc] = useState(null) // For display: most recent ethereum RPC call
+  const [isFetchingEtherscan, setIsFetchingEtherscan] = useState(false) // UI: Show spinner while fetching addresses
+  const [fetchError, setFetchError] = useState(null) // Error text when fetching addresses
+const [isDecoding, setIsDecoding] = useState(false)
+  // Utility: calculates size of the anonymity set (ring size)
   const anonymitySetSize = useMemo(() => ringAddresses.length, [ringAddresses])
 
+  // For UI/buttons: Do we currently have a full (5-member) ring?
   const hasRing = ringAddresses.length === 5
+  // For UI/buttons: Can user actually sign a message now?
   const canSign = hasRing && connectedAddress && extSigner && message.trim().length > 0
 
+  // Connect to MetaMask and get user account (Ethereum address and signer)
   async function connectWallet() {
     if (!window.ethereum) {
       alert('No Ethereum provider found. Please install MetaMask.')
       return
     }
+    // Use ethers.js BrowserProvider to connect/request accounts
     const browserProvider = new BrowserProvider(window.ethereum)
     await browserProvider.send('eth_requestAccounts', [])
     setLastRpc({ method: 'eth_requestAccounts', params: [] })
@@ -47,10 +54,11 @@ function App() {
     }
   }
 
+  // Create N new random local wallets (private keys) excluding specified addresses
   function generateUniqueRandomWallets(excludeAddresses, count) {
     const lowerExcludes = new Set(excludeAddresses.map(a => a.toLowerCase()))
     const wallets = []
-    const addresses = new Set()
+    const addresses = new Set() // Track in lowercase for collision avoidance
     while (wallets.length < count) {
       const w = Wallet.createRandom()
       const addr = w.address
@@ -62,23 +70,23 @@ function App() {
     return wallets
   }
 
+  // Build a (shuffled) ring array of 1 external wallet + 4 random local wallets
   async function generateRing() {
     if (!connectedAddress) {
       alert('Please connect your wallet first')
       return
     }
-    
+    // Generate 4 unique local wallets, excluding the user
     const locals = generateUniqueRandomWallets([connectedAddress], 4)
     const members = [
       { address: connectedAddress, type: 'external' },
       ...locals.map(w => ({ address: w.address, type: 'local', wallet: w })),
     ]
-    // shuffle so connected wallet is not always index 0
+    // Shuffle so MetaMask wallet address is indistinguishable in the set
     const shuffled = members
       .map(v => ({ v, sort: Math.random() }))
       .sort((a, b) => a.sort - b.sort)
       .map(({ v }) => v)
-    
     const addresses = shuffled.map(m => m.address)
     setRingMembers(shuffled)
     setRingAddresses(addresses)
@@ -89,49 +97,43 @@ function App() {
     setVerificationResult(null)
   }
 
+  // Sign the message as the hidden member in the ring (either true ring or ECDSA "ring-concept")
   async function signWithHiddenMember() {
     if (!canSign) return
     if (!extSigner || !connectedAddress) {
       alert('Please connect your wallet first')
       return
     }
-    
     try {
       setVerificationResult(null)
-      // Check if we have a local wallet (with private key) for the signer
+      // See if the hidden member is a local wallet (true ring sig) or external (MetaMask)
       const signerMember = ringMembers[hiddenIndex]
       let privateKey = null
-      
+
       if (signerMember?.type === 'local' && signerMember?.wallet) {
-        // Local wallet - we have the private key, can generate true ring signature
+        // True ring signature: we have the private key available (fully local)
         privateKey = signerMember.wallet.privateKey
         const privateKeyBytes = getPrivateKeyBytes(privateKey)
-        
-        // Generate true ring signature
+        // Generate simplified ring signature structure
         const ringSig = generateSimplifiedRingSignature(
           message,
           privateKeyBytes,
           ringAddresses,
           hiddenIndex
         )
-        
         setRingSignature(ringSig)
         setLastRpc({ method: 'ring_signature', params: [message, ringAddresses, hiddenIndex] })
-        
-        // Also store traditional signature for comparison
+        // Also keep native/traditional ECDSA sig for recover demo
         const traditionalSig = await signerMember.wallet.signMessage(message)
         setSignature(traditionalSig)
         setRecoveredAddress(null)
       } else {
-        // External wallet (MetaMask) - we can't access private key
-        // For external wallets, we'll use traditional ECDSA but structure it as ring
+        // MetaMask (external) wallet: do a standard ECDSA signature, but package it in the "ring" structure for demo
         setLastRpc({ method: 'personal_sign', params: [message, connectedAddress] })
         const sig = await extSigner.signMessage(message)
         setSignature(sig)
         setRecoveredAddress(null)
-        
-        // Create a ring signature structure even though we used ECDSA
-        // This demonstrates the concept but isn't a true ring sig
+        // This "ringSignature" is only conceptual (not cryptographically hiding signer)
         const ringSig = {
           ring: ringAddresses,
           signerIndex: hiddenIndex,
@@ -150,35 +152,35 @@ function App() {
     }
   }
 
+  // Fetch 4 live addresses from the latest Ethereum block (excl. user) for a ring
   async function fetchFourAddressesFromEtherscan() {
     if (!connectedAddress) {
       alert('Please connect your wallet first')
       return
     }
-    
     setFetchError(null)
-    const apiKey = "FYYKM5131QH86W8MZGRF2W9DEGA3JPTF1X"
+    const apiKey = "FYYKM5131QH86W8MZGRF2W9DEGA3JPTF1X" // Demo key for Etherscan, can be swapped with env var
     if (!apiKey) {
       setFetchError('Missing VITE_ETHERSCAN_API_KEY in environment')
       return
     }
     try {
       setIsFetchingEtherscan(true)
-      // 1) Get latest block number using V2 API (JSON-RPC format)
+      // Step 1: Fetch latest block number via Etherscan V2 API
       const bnRes = await fetch(`https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_blockNumber&apikey=${apiKey}`)
       const bnJson = await bnRes.json()
       if (bnJson.error || !bnJson.result) {
         throw new Error(bnJson.error?.message || 'Failed to get latest block number')
       }
       const latestHex = bnJson.result
-      // 2) Get block by number with full tx objects using V2 API (JSON-RPC format)
+      // Step 2: Fetch the full block transactions
       const blkRes = await fetch(`https://api.etherscan.io/v2/api?chainid=1&module=proxy&action=eth_getBlockByNumber&tag=${latestHex}&boolean=true&apikey=${apiKey}`)
       const blkJson = await blkRes.json()
       if (blkJson.error || !blkJson.result) {
         throw new Error(blkJson.error?.message || 'Failed to get block details')
       }
       const txs = blkJson.result.transactions || []
-      // 3) Collect unique addresses from recent transactions, excluding connected address
+      // Step 3: Gather unique addresses from recent transactions, excluding our connected address
       const uniq = new Set()
       const connectedLower = connectedAddress.toLowerCase()
       for (const tx of txs) {
@@ -188,22 +190,21 @@ function App() {
         if (tx?.to && tx.to.toLowerCase() !== connectedLower) {
           uniq.add(tx.to.toLowerCase())
         }
-        if (uniq.size >= 10) break // collect enough to sample from
+        if (uniq.size >= 10) break // Grab a pool large enough to sample 4
       }
       const addrList = Array.from(uniq)
       if (addrList.length < 4) throw new Error('Not enough addresses in the latest block (excluding your wallet)')
-      // 4) Pick first 4 and combine with connected wallet
+      // Step 4: Prepare first 4 + connected address for ring
       const four = addrList.slice(0, 4)
       const allAddresses = [
         { address: connectedAddress, type: 'external' },
         ...four.map(a => ({ address: a, type: 'external' }))
       ]
-      // shuffle so connected wallet is not always index 0
+      // Shuffle for privacy: don't expose which index is user's real account
       const shuffled = allAddresses
         .map(v => ({ v, sort: Math.random() }))
         .sort((a, b) => a.sort - b.sort)
         .map(({ v }) => v)
-      
       const addresses = shuffled.map(m => m.address)
       setRingMembers(shuffled)
       setRingAddresses(addresses)
@@ -219,61 +220,83 @@ function App() {
     }
   }
 
-  function decodeAndVerifySignature() {
+  // Decode and verify (ring or ECDSA) signature, showing verification details
+  async function decodeAndVerifySignature() {
     if (!ringSignature) {
       alert('Generate a ring signature first')
       return
     }
+    setIsDecoding(true)
+    setVerificationResult(null)
+    setRecoveredAddress(null)
+
+    // Brief delay so the spinner is visible to the user (UI feedback)
+    await new Promise(res => setTimeout(res, 450))
 
     try {
+      let result
+      console.log("Starting decodeAndVerifySignature...");
+      console.log("Message:", message)
+      console.log("ringSignature:", ringSignature)
+      console.log("ringAddresses:", ringAddresses)
+      // Handle the "true" ring signature structure
       if (ringSignature.signature?.type === 'ring_ecdsa_concept') {
+        console.log('Detected ring signature type: ring_ecdsa_concept')
         const verification = verifyRingSignature(message, ringSignature, ringAddresses)
+        console.log('verifyRingSignature result:', verification)
         if (verification.recoveredPublicKey) {
           setRecoveredAddress(verification.recoveredPublicKey)
+          console.log('Recovered public key (ring):', verification.recoveredPublicKey)
         }
-        setVerificationResult({
+        result = {
           type: 'ring',
           pass: verification.valid && verification.inRing,
           message: verification.valid && verification.inRing
             ? `Cryptographically verified: signer is one of ${ringAddresses.length} ring members.`
             : verification.error || 'Ring verification failed.',
           details: verification
-        })
-      } else {
-        const signatureToVerify = ringSignature.signature?.signature || signature
-        if (!signatureToVerify) {
-          throw new Error('Missing ECDSA signature payload')
         }
+        console.log('Ring verification result:', result)
+      } else {
+        // Handle basic ECDSA recovery (from regular or external wallet signature)
+        const signatureToVerify = ringSignature.signature?.signature || signature
+        console.log('Verifying ECDSA signature:', signatureToVerify)
         const recovered = verifyMessage(message, signatureToVerify)
+        console.log('Recovered address (ecdsa):', recovered)
         setRecoveredAddress(recovered)
         const inRing = ringAddresses.some(addr => addr.toLowerCase() === recovered.toLowerCase())
-        setVerificationResult({
+        console.log('Is recovered address in ring?', inRing)
+        result = {
           type: 'ecdsa',
           pass: inRing,
           message: inRing
             ? 'Recovered signer belongs to the current ring.'
             : 'Recovered signer is outside of the current ring.',
           details: { recovered }
-        })
+        }
+        console.log('ECDSA verification result:', result)
       }
+      setVerificationResult(result)
     } catch (error) {
-      setVerificationResult({
-        type: 'error',
-        pass: false,
-        message: error?.message || 'Failed to decode signature.'
-      })
+      console.error('Error decoding and verifying signature:', error)
+      alert('Error decoding and verifying signature: ' + error.message)
+    } finally {
+      setIsDecoding(false)
+      console.log('decodeAndVerifySignature complete.')
     }
   }
 
-  // Demo component content
+  // The main content of the Demo (rendered for the 'demo' tab/page)
   const DemoContent = () => (
     <>
+      {/* Title and introductory instructions */}
       <h1>Ring Signature (Concept) vs ECDSA</h1>
       <p style={{ marginTop: 8, lineHeight: 1.5 }}>
         Follow the two steps below to create a ring signature and then decode it to
         confirm whether the signer belongs to the anonymity set.
       </p>
 
+      {/* Step 1: Generate Ring Signature section */}
       <div className="card" style={{ marginTop: 16 }}>
         <h2 style={{ margin: 0 }}>Step 1 · Generate the Ring Signature</h2>
         <p style={{ marginTop: 6, opacity: 0.75 }}>
@@ -281,6 +304,7 @@ function App() {
           produce a ring signature payload.
         </p>
 
+        {/* Wallet connect and status row */}
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 12 }}>
           <button onClick={connectWallet}>Connect Wallet</button>
           {connectedAddress && (
@@ -289,6 +313,8 @@ function App() {
             </span>
           )}
         </div>
+
+        {/* Display current network */}
         {(connectedAddress || network) && (
           <div style={{ marginTop: 8, fontSize: 13, opacity: 0.9 }}>
             {network && (
@@ -296,12 +322,15 @@ function App() {
             )}
           </div>
         )}
+
+        {/* Prompt to connect wallet if needed */}
         {!connectedAddress && (
           <div style={{ marginTop: 12, padding: 12, background: 'rgba(255,165,0,0.1)', border: '1px solid rgba(255,165,0,0.3)', borderRadius: 6 }}>
             Connect your wallet to continue. It will act as the hidden signer.
           </div>
         )}
 
+        {/* Once connected, prompts to create a full ring */}
         {connectedAddress && !hasRing && (
           <div style={{ marginTop: 16 }}>
             <div style={{ marginBottom: 8, fontWeight: 600 }}>Create a 5-member ring</div>
@@ -316,6 +345,8 @@ function App() {
             </div>
           </div>
         )}
+
+        {/* Spinner for Etherscan fetch */}
         {isFetchingEtherscan && (
           <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 10 }}>
             <div style={{
@@ -329,12 +360,16 @@ function App() {
             <span style={{ opacity: 0.9 }}>Fetching 4 addresses from Etherscan…</span>
           </div>
         )}
+
+        {/* Error message if Etherscan fetch fails */}
         {fetchError && (
           <div style={{ marginTop: 8, color: 'orangered' }}>{fetchError}</div>
         )}
 
+        {/* After ring assembly, let user enter message and sign */}
         {hasRing && (
           <>
+            {/* Enter the message to be signed */}
             <div style={{ marginTop: 20 }}>
               <div style={{ marginBottom: 8, fontWeight: 600 }}>Message to sign</div>
               <input
@@ -347,6 +382,7 @@ function App() {
                 style={{ width: '100%', padding: 8 }}
               />
             </div>
+            {/* Trigger signing, opt to reveal hidden signer (debug) */}
             <div style={{ marginTop: 12, display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
               <button onClick={signWithHiddenMember} disabled={!canSign}>
                 Generate Ring Signature
@@ -357,15 +393,18 @@ function App() {
               </label>
             </div>
 
+            {/* Ring member visual representation */}
             <div style={{ marginTop: 20 }}>
               <h3 style={{ marginTop: 0 }}>Ring Members ({anonymitySetSize})</h3>
               <div style={{ position: 'relative', height: 260, marginBottom: 12, border: '1px dashed #555', borderRadius: 8 }}>
                 {ringAddresses.map((addr, idx) => {
+                  // Arrange members in a circle
                   const n = ringAddresses.length
                   const angle = (2 * Math.PI * idx) / n - Math.PI / 2
                   const radius = 100
                   const dx = radius * Math.cos(angle)
                   const dy = radius * Math.sin(angle)
+                  // Visual highlight/indicator logic
                   const isHidden = hiddenIndex === idx
                   const isRecovered = recoveredAddress && addr.toLowerCase() === recoveredAddress.toLowerCase()
                   const border = isRecovered ? '3px solid limegreen' : isHidden && revealSigner ? '2px dashed orange' : '2px solid #888'
@@ -400,11 +439,13 @@ function App() {
                     </div>
                   )
                 })}
+                {/* Center label */}
                 <div style={{ position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%,-50%)', textAlign: 'center' }}>
                   <div style={{ fontSize: 12, opacity: 0.8 }}>Ring</div>
                   <div style={{ fontWeight: 700 }}>5 members</div>
                 </div>
               </div>
+              {/* Member list legend */}
               <ol style={{ paddingLeft: 18 }}>
                 {ringAddresses.map((addr, idx) => (
                   <li key={addr} style={{ marginBottom: 6 }}>
@@ -424,6 +465,7 @@ function App() {
           </>
         )}
 
+        {/* Once signature is created, show summary */}
         {ringSignature && (
           <div style={{ marginTop: 20, padding: 12, background: 'rgba(76, 175, 80, 0.1)', border: '1px solid rgba(76, 175, 80, 0.3)', borderRadius: 6 }}>
             <div style={{ fontWeight: 700, marginBottom: 8, color: '#4CAF50' }}>
@@ -449,6 +491,7 @@ function App() {
           </div>
         )}
 
+        {/* Show the raw signature bytes (ECDSA) */}
         {signature && (
           <div style={{ marginTop: 12 }}>
             <div style={{ fontWeight: 600 }}>Raw Signature Payload</div>
@@ -456,6 +499,7 @@ function App() {
           </div>
         )}
 
+        {/* Show last RPC made for transparency/debugging */}
         {lastRpc && (
           <div style={{ marginTop: 12 }}>
             <div style={{ fontWeight: 600, marginBottom: 6 }}>Latest Ethereum request</div>
@@ -471,6 +515,7 @@ function App() {
         )}
       </div>
 
+      {/* Step 2: Decode & verify UI */}
       <div className="card" style={{ marginTop: 16 }}>
         <h2 style={{ margin: 0 }}>Step 2 · Decode & Verify</h2>
         <p style={{ marginTop: 6, opacity: 0.75 }}>
@@ -479,23 +524,34 @@ function App() {
         <button
           onClick={decodeAndVerifySignature}
           disabled={!ringSignature}
-          style={{ marginTop: 12 }}
+          style={{
+            marginTop: 12,
+            position: 'relative',
+            overflow: 'hidden',
+            opacity: isDecoding ? 0.7 : 1,
+            transition: 'all 0.2s',
+          }}
         >
           Decode Signature & Run Verification
         </button>
+        {/* Disable decode button until signature exists */}
         {!ringSignature && (
           <div style={{ marginTop: 10, opacity: 0.8 }}>
             Generate a ring signature in Step 1 to enable decoding.
           </div>
         )}
 
+        {/* Output the recovered address from verification */}
         <div style={{ marginTop: 18 }}>
           <div style={{ fontWeight: 600 }}>Recovered Public Key / Address</div>
-          <code style={{ fontSize: 12 }}>{recoveredAddress || 'N/A'}</code>
+          <code style={{ fontSize: 12 }}>{recoveredAddress || ''}</code>
         </div>
 
+        {/* Show verification pass/fail and reason */}
         {verificationResult && (
-          <div style={{ marginTop: 16, border: '1px solid #444', borderRadius: 8, padding: 12 }}>
+          <div style={{ marginTop: 16, border: '1px solid #444', borderRadius: 8, padding: 12 
+     , animation: 'slideFade 300ms ease-out'
+          }}>
             <div style={{ fontWeight: 700, marginBottom: 6 }}>
               Result:{' '}
               {verificationResult.pass ? (
@@ -507,11 +563,13 @@ function App() {
             <div style={{ fontSize: 13, lineHeight: 1.5 }}>
               {verificationResult.message}
             </div>
+            {/* If ring signature and in-ring success, show confirmation */}
             {verificationResult.type === 'ring' && verificationResult.details?.inRing && (
               <div style={{ marginTop: 8, fontSize: 12, opacity: 0.85 }}>
                 ✅ Signer confirmed within the {anonymitySetSize}-member ring.
               </div>
             )}
+            {/* If ECDSA, display the recovered EOA address */}
             {verificationResult.type === 'ecdsa' && verificationResult.details?.recovered && (
               <div style={{ marginTop: 8, fontSize: 12, opacity: 0.85 }}>
                 Recovered signer: <code>{verificationResult.details.recovered}</code>
@@ -520,11 +578,10 @@ function App() {
           </div>
         )}
       </div>
-
-  
     </>
   )
 
+  // Full app layout: navigation tabs and conditional page content
   return (
     <div style={{ maxWidth: 1200, margin: '0 auto', padding: 16 }}>
       {/* Page Navigation Tabs */}
@@ -575,7 +632,7 @@ function App() {
         </button>
       </div>
 
-      {/* Render current page */}
+      {/* Render page content: either Demo view or Overview page */}
       {currentPage === 'demo' ? (
         <div style={{ maxWidth: 900, margin: '0 auto' }}>
           <DemoContent />
